@@ -217,6 +217,11 @@ class Game:
         return sorted(p.name for p in self.folder.iterdir() if p.suffix.lower() in SOURCE_SUFFIXES)
 
     @property
+    def fingerprint(self) -> list:
+        """The game files as of now (name and size): a DLC or update added after the first build changes it, and the engine then extracts the new file. Everything it already built is reused."""
+        return sorted(f'{p.name}:{p.stat().st_size}' for p in self.folder.iterdir() if p.suffix.lower() in SOURCE_SUFFIXES)
+
+    @property
     def package(self) -> Optional[str]:
         patched = sorted(self.build.glob('patched_*')) if self.build else []
         patched = [p for p in patched if p.is_dir()]
@@ -265,7 +270,9 @@ class Game:
 
     @property
     def prepared(self) -> bool:
-        return bool(self.package and self.romfs and self.shaders)
+        """Built, and for the game files in the folder now. A build from before TVPort noted its files has no list to compare, so it counts as current."""
+        seen = self.state().get('sources')
+        return bool(self.package and self.romfs and self.shaders) and (seen is None or seen == self.fingerprint)
 
     @property
     def state_file(self) -> Optional[Path]:
@@ -653,6 +660,8 @@ def prepare_game(game: Game, keys: Optional[Path], team: str, python: str) -> Ga
         command += ['--team-id', team]
     stream(command, cwd=REPO)
     game = Game(game.folder)
+    if game.build:
+        game.save_state(sources=game.fingerprint)
     if not game.prepared:
         raise Failure('The engine finished without shaders or game files for this game. See the log above.')
     return game
@@ -662,7 +671,7 @@ def generate_project(game: Game, args, team: str, bundle: str, python: str) -> P
     stage('Generating the Apple TV project')
     restore_tables(game)
     env = profile_env(game)
-    env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(game.romfs), MSL_IOS=str(game.shaders), AOC='',
+    env.update(GAME=game.title_id, W=str(game.build), PATCHED=str(game.build / f'patched_{game.package}'), ROMFS=str(game.romfs), MSL_IOS=str(game.shaders), AOC=str(game.build / 'aoc') if (game.build / 'aoc').is_dir() else '',
                DM_TVOS='1', DM_COPY_ROMFS='NO', DM_SHOW_FPS='1' if args.fps else '0', DM_ENV_FILE=str(write_env(game, args.mode, args.texture_cap, args.players, args.render_scale, not args.no_thermal_cap, args.fps_target)), DM_BUNDLE_ID=bundle, DM_TEAM_ID=team,
                DM_XCODE_PROJECT_DIR=str(game.build / 'tvport-xcode'), DM_XCODE_DERIVED_DATA=str(game.build / 'tvport-derived'), FONT_PY=python)
     art = args.art or game.icon
@@ -759,6 +768,8 @@ def cmd_build(args) -> None:
     os.environ['PATH'] = os.pathsep.join([str(Path(python).parent), os.environ.get('PATH', '')])   # the engine's own `python3` calls (build_ipa.sh) take this one, not the system's 3.9
     if not game.prepared:
         game = prepare_game(game, args.keys, team, python)
+    elif 'sources' not in game.state():
+        game.save_state(sources=game.fingerprint)
     bundle = game.bundle_id(team)
     if args.device:
         remember_shaders(game, args.device, bundle)
