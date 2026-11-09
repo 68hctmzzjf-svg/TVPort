@@ -487,6 +487,28 @@ class GameFolder(unittest.TestCase):
             self.make(folder, '0100000000010000_build/patched_v1/main.patched.bin', '0100000000010000_build/extract/v1/RomFS.img', '0100000000010000_build/shader/ios/b-000000000000/inputs.tsv')
             self.assertFalse(backend.Game(Path(folder)).prepared)
 
+    def built(self, folder):
+        self.make(folder, 'Game.nsp', f'0100000000010000_build/patched_v1/main.patched.bin', '0100000000010000_build/extract/v1/RomFS.img', f'0100000000010000_build/shader/ios/b-{backend.chain()}/inputs.tsv')
+        return backend.Game(Path(folder))
+
+    def test_a_dlc_added_after_the_build_asks_the_engine_to_prepare_again(self):
+        with tempfile.TemporaryDirectory() as folder:
+            game = self.built(folder)
+            self.assertTrue(game.prepared)
+            game.save_state(sources=game.fingerprint)
+            self.assertTrue(backend.Game(Path(folder)).prepared)
+            (Path(folder) / 'DLC.nsp').write_text('dlc')
+            self.assertFalse(backend.Game(Path(folder)).prepared)
+            game = backend.Game(Path(folder))
+            game.save_state(sources=game.fingerprint)
+            self.assertTrue(backend.Game(Path(folder)).prepared)
+
+    def test_a_build_without_a_noted_file_list_counts_as_current(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.built(folder)
+            (Path(folder) / 'DLC.nsp').write_text('dlc')
+            self.assertTrue(backend.Game(Path(folder)).prepared)
+
     def test_new_bundle_id_comes_from_team_and_title(self):
         with tempfile.TemporaryDirectory() as folder:
             self.make(folder, '0100ABCD00000000_build/x')
