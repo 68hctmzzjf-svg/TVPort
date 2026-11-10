@@ -2,6 +2,9 @@
 // Only entry points that go to a service are hooked; library functions that only read and write the game's own buffers (prepo Add / Array / Struct, err ErrorResultVariant, friends getters, socket byte-order conversion) keep running in the SDK.
 // Return convention as in hle_friends.c: Result returns RES_FAIL ("saved / submitted" kinds return RES_OK so the game does not retry); bool returns false; events get a bound SystemEvent that never fires.
 #include "hle.h"
+#include <poll.h>
+#include <sys/select.h>
+#include <string.h>
 
 static _Alignas(16) uint8_t g_ev_ldn[0x100];
 
@@ -51,10 +54,18 @@ HLE_FORCE("_ZN2nn6socket10InitializeEPvmmi", "connects to the bsd socket service
 HLE_FORCE("_ZN2nn6socket8FinalizeEv", "pairs with Initialize (cut)", Result, h_sk_Fini, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn6socket12GetLastErrnoEv", "offline: ENETDOWN", int, h_sk_Errno, void) { return SK_ENETDOWN; }
 HLE_FORCE("_ZN2nn6socket6SocketEiii", "offline (cut): -1", int, h_sk_Socket3i, int a, int b, int c) { (void)a; (void)b; (void)c; return -1; }
-HLE_FORCE("_ZN2nn6socket8ShutdownEii", "offline (cut)", int, h_sk_Shutdown, int s, int h) { (void)s; (void)h; return -1; }
 HLE_FORCE("_ZN2nn6socket4BindEiPK8sockaddrj", "offline (cut)", int, h_sk_Bind, int s, const void *a, unsigned n) { (void)s; (void)a; (void)n; return -1; }
-int dm_sk_poll(void *fds, uint64_t n, int ms);   // hle_net.c: nothing to wait on → the timeout passes, 0; else -1
-int dm_sk_select(int nfds, const uint64_t *r, const uint64_t *w, const uint64_t *e, const int64_t *tv);
+int dm_sk_poll(void *fds, uint64_t n, int ms) {   // the socket pass-through's real poll (hle_net.c keeps the loopback sockets)
+    return poll(fds, (nfds_t)n, ms);
+}
+int dm_sk_select(int nfds, const uint64_t *r, const uint64_t *w, const uint64_t *e, const int64_t *tv) {
+    fd_set rr, ww, ee; struct timeval d;
+    if (r) memcpy(&rr, r, sizeof rr); if (w) memcpy(&ww, w, sizeof ww); if (e) memcpy(&ee, e, sizeof ee);
+    if (tv) d = (struct timeval){ tv[0], tv[1] };
+    int k = select(nfds, r ? &rr : NULL, w ? &ww : NULL, e ? &ee : NULL, tv ? &d : NULL);
+    if (r) memcpy((void *)r, &rr, sizeof rr); if (w) memcpy((void *)w, &ww, sizeof ww); if (e) memcpy((void *)e, &ee, sizeof ee);
+    return k;
+}
 HLE_FORCE("_ZN2nn6socket4PollEP6pollfdmi", "offline: waits out the timeout when there is nothing to wait on, else fails", int, h_sk_Poll, void *p, uint64_t n, int t) { return dm_sk_poll(p, n, t); }
 // SDK 4's Select with plain fd_set / timeval (Dark Souls Remastered)
 HLE_FORCE("_ZN2nn6socket6SelectEiP6fd_setS2_S2_P7timeval", "offline: waits out the timeout when there is nothing to wait on, else fails", int, h_sk_Select2, int n, void *r, void *w, void *e, void *t) { return dm_sk_select(n, r, w, e, t); }
