@@ -176,3 +176,15 @@ HLE_FORCE("_ZN2nn4pctl28IsFreeCommunicationAvailableEv", "parental controls · w
 HLE_FORCE("_ZN2nn4pctl27CheckStereoVisionPermissionEb", "parental controls · stereoscopic 3D permission; the host has no VR display, not permitted", unsigned, h_pctl_Stereo, unsigned show_ui) { (void)show_ui; return 0; }
 
 // swkbd software keyboard: see hle_swkbd.c
+
+// Minecraft Bedrock's boot reads the purchase state of the "purchased event" (its own entitlement sync) right after the first
+// present: the SDK's nn::ec::InitializePurchasedEvent creates an OS event through the ec service the host does not serve and
+// SIGSEGVs on the service object (pc sdk+0x35ebe4). The event only says "the purchase list changed", which offline never
+// happens: bind a never-signalled SystemEvent, as the aoc notification events do
+// Minecraft Bedrock's entitlement sync: InitializePurchasedEvent creates the SDK's internal event (Result only, no parameter —
+// binding the register's stale x0 crashed), GetPurchasedEvent hands the game the event to wait on (offline it never signals),
+// PopPurchasedItemInfo drains the purchase list (offline: empty). The ShopServiceAccessor family above already refuses offline
+static _Alignas(16) uint8_t g_ec_ev[0x100];
+HLE_FORCE("_ZN2nn2ec24InitializePurchasedEventEv", "purchased-event change notification; offline it never changes: created, never signalled", Result, h_ec_InitPurchasedEvent0, void) { hle_bind_system_event(g_ec_ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn2ec17GetPurchasedEventEv", "the purchased-event; bound, never signalled offline", void *, h_ec_GetPurchasedEvent, void) { return g_ec_ev; }
+HLE_FORCE("_ZN2nn2ec20PopPurchasedItemInfoEPNS0_17PurchasedItemInfoE", "purchase list drain; offline the list is empty", unsigned, h_ec_PopItem, void *out) { (void)out; return 0; }
