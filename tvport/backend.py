@@ -261,7 +261,8 @@ class Game:
         if not self.build:
             return None
         folder = self.build / 'shader/ios'
-        return folder if (folder / f'b-{chain()}/inputs.tsv').is_file() else None
+        # NVN games carry the chain's b-<V>/ stamp; a Vulkan or GL game carries vk/ or gl/ (dm/gfx/tools/vk_shaders.py / gl_shaders.py), as build_ipa.sh's GFXAPI detection takes them
+        return folder if (folder / f'b-{chain()}/inputs.tsv').is_file() or (folder / 'vk/vk_shaders.metallib').is_file() or (folder / 'gl/gl_shaders.metallib').is_file() else None
 
     @property
     def prepared(self) -> bool:
