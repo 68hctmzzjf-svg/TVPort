@@ -3,8 +3,10 @@
 #include "dm.h"
 #include <TargetConditionals.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
 #include <limits.h>
 #include <mach-o/getsect.h>
@@ -199,6 +201,19 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "FILE_IMAGE_LEN")) m->file_image_len = v;
         else if (!strcmp(key, "BACK_OFF")) m->back_off = v;
         else if (!strcmp(key, "BACK_LEN")) m->back_len = v;
+        else if (!strcmp(key, "FAR") || !strcmp(key, "FARX")) {
+            // a far jump (FAR: a site no island or relay reaches, brk #0xA000) or a far exit (FARX: a stub's exit back to the code, brk #0xA001 — the old ADRP+BR x16 exit
+            // clobbered a live x16): the SIGTRAP handler sets pc to the to-offset (a signal return has no ±128 MiB limit and touches no register)
+            unsigned long fr, tt; if (sscanf(line, "# %*s %lx %lx", &fr, &tt) == 2) {
+                m->far_from = realloc(m->far_from, (m->nfar + 1) * sizeof *m->far_from);
+                m->far_to = realloc(m->far_to, (m->nfar + 1) * sizeof *m->far_to);
+                m->far_from[m->nfar] = fr; m->far_to[m->nfar] = tt; m->nfar++;
+            }
+        }
+        else if (!strcmp(key, "GAP2_OFF")) m->gap2_off = v;
+        else if (!strcmp(key, "GAP3_OFF")) m->gap3_off = v;
+        else if (!strcmp(key, "GAP3_LEN")) m->gap3_len = v;
+        else if (!strcmp(key, "GAP2_LEN")) m->gap2_len = v;
         else if (!strcmp(key, "KEY_PAGE_OFF")) m->key_page_off = v;
         else if (!strcmp(key, "KEY_PAGE_SIZE")) m->key_page_size = v;
         else if (!strcmp(key, "TEXT_END")) m->text_end = v;
@@ -261,6 +276,49 @@ static void install_key_page(module_t *m) {
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
+}
+
+// The frame page's relays (patch_nso.py: the highest band sites of a text no split reaches — Minecraft Bedrock 1.26.60's
+// 193 MB main): 4-byte B entries to the back stubs, written into the page beyond the key page from <name>.relays.tsv
+// (the page lies beyond the file image, so only the loader can place them) and sealed executable
+static void install_frame_relays(module_t *m, const char *dir) {
+    char path[1024], line[64]; snprintf(path, sizeof path, "%s/%s.relays.tsv", dir, m->name);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    unsigned n = 0; unsigned long off, w;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "%lx %lx", &off, &w) == 2) {
+        if (off < m->key_page_off + 0x4000 || off + 4 > m->key_page_off + 0x8000 || off > m->size) die("%s: relay %#lx outside the frame page", m->name, off);
+        *(uint32_t *)(m->base + off) = (uint32_t)w; n++;
+    }
+    fclose(f);
+    if (n && mprotect(m->base + m->key_page_off + 0x4000, 0x4000, PROT_READ | PROT_EXEC)) die("%s frame relay mprotect", m->name);
+    LOG("%s: %lu frame page relays", m->name, n);
+}
+
+// Far jumps (S2Arm's trick, ported for Minecraft Bedrock 1.26.60's main): sites no island or relay reaches hold
+// brk #0xA000, and this SIGTRAP hook sets pc to the stub — a signal return has no ±128 MiB limit. The stub's exit is
+// its own ADRP + BR. One ~µs signal round-trip per execution of such a site
+static int far_jump(ucontext_t *uc) {
+    uint64_t pc = uc->uc_mcontext->__ss.__pc;
+    for (int i = 0; i < g_nmod; i++) {
+        module_t *m = &g_mod[i];
+        if (!m->nfar) continue;
+        uint64_t off = pc - (uint64_t)m->base;   // the code or a patch island of this module
+        int in_text = off < m->text_end;
+        int in_patch = m->patch_off < 0 ? (int64_t)off >= m->patch_off && (int64_t)off < m->patch_off + (int64_t)m->patch_len : off >= m->patch_off && off < m->patch_off + m->patch_len;
+        int in_back = m->back_len && off >= m->back_off && off < m->back_off + m->back_len;
+        if (!(in_text || in_patch || in_back)) { if (m == &g_mod[0]) LOG("far_jump: pc=%#llx %s off=%#llx OUT of range (text_end %#llx patch [%#llx..%#llx) back [%#llx..%#llx))", (unsigned long long)pc, m->name, (unsigned long long)off, (unsigned long long)m->text_end, (unsigned long long)m->patch_off, (unsigned long long)(m->patch_off + m->patch_len), (unsigned long long)m->back_off, (unsigned long long)(m->back_off + m->back_len)); continue; }
+        uint32_t fw = *(uint32_t *)pc;
+        if (fw != (0xD4200000u | 0xA000u << 5) && fw != (0xD4200000u | 0xA001u << 5)) { LOG("far_jump: pc=%#llx %s off=%#llx word=%#x NOT our brk", (unsigned long long)pc, m->name, (unsigned long long)off, fw); continue; }
+        for (unsigned k = 0; k < m->nfar; k++) if (m->far_from[k] == off) {
+            uc->uc_mcontext->__ss.__pc = (uint64_t)m->base + m->far_to[k];
+            static int hits; if (hits < 3) LOG("far jump #%d: site %s+%#llx → stub %#llx", ++hits, m->name, (unsigned long long)off, (unsigned long long)m->far_to[k]);
+            return 1;
+        }
+        die("%s: far-jump brk at %#llx is not in the FAR table", m->name, (unsigned long long)off);
+    }
+    LOG("far_jump: RETURNED 0 for pc=%#llx (nmod %d, hook reached)", (unsigned long long)pc, g_nmod);
+    return 0;
 }
 
 static void register_gates(module_t *m, const char *dir) {
@@ -403,7 +461,8 @@ static void preload_nros(const char *dir, FILE *f) {
         module_t *m = &g_mod[g_nmod];
         strlcpy(m->name, name, sizeof m->name); m->nro = 1; m->nro_size = size;
         for (int k = 0; k < 32; k++) sscanf(hex + 2 * k, "%2hhx", &m->sha256[k]);
-        read_layout(m, dir); map_image(m, dir); parse_dynamic(m); register_gates(m, dir);
+        read_layout(m, dir); map_image(m, dir); parse_dynamic(m); register_gates(m, dir); install_frame_relays(m, dir);
+        if (m->nfar) LOG("%s: %u far jumps", m->name, m->nfar);
         // The NRO header gives initialized data separately from bss. Keep only those bytes: bss is known zero before the first load, even for FFX's 925 MB static heap.
         m->pristine_len = *(const uint32_t *)(m->base + 0x34);
         if (*(const uint32_t *)(m->base + 0x30) != m->data_off || m->pristine_len > m->key_page_off - m->data_off) die("%s: NRO data layout mismatch", m->name);
@@ -644,10 +703,21 @@ void load_modules(const char *dir, const char **names, int n) {
         m->loaded = 1; g_loaded[g_nloaded++] = m; g_nmod++;
     }
     force_init();
-    t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
+    t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr += now_ns() - t;
     force_check();
+    // The relay pages (a text no split reaches: patch_nso.py's band sites) are sealed only now: relocation still writes
+    // pointers into the pages they share (the ro segment's last page, the file image pad after data)
+    for (int i = 0; i < g_nmod; i++) { module_t *m = &g_mod[i];
+        if (m->gap2_len && mprotect(m->base + m->gap2_off, m->gap2_len, PROT_READ | PROT_EXEC)) die("%s mprotect gap relays", m->name);
+        if (m->gap3_len && mprotect(m->base + m->gap3_off, m->gap3_len, PROT_READ | PROT_EXEC)) die("%s mprotect pad relays", m->name);
+    }
     preload_nros(dir, nros);   // mapped now, relocated when the game loads them (hle_ro.c)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
+    {   // the far-jump hook (only when a module has FAR sites): the trap hook chain in crash.c asks here first
+        int any = 0; for (int i = 0; i < g_nmod; i++) any |= g_mod[i].nfar != 0;
+        if (any) { void crash_set_trap_hook(int (*fn)(ucontext_t *)); crash_set_trap_hook(far_jump); LOG("far-jump trap hook registered"); }
+        else LOG("far-jump trap hook NOT registered (no module has FAR rows)");
+    }
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK: %lu symbol lookups at load time, hash and linear disagree %lu", g_symchk_n, g_symchk_bad);
     if (g_flag.bootprof) LOG("① breakdown: mapping (read + copy + seal pages) %.1f ms, dynamic section parsing %.1f ms, gate registration %.1f ms, relocation + forced takeover %.1f ms, total %.1f ms",
                              tm / 1e6, tp / 1e6, tg / 1e6, tr / 1e6, (now_ns() - t0) / 1e6);
