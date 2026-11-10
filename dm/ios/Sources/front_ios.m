@@ -116,6 +116,10 @@ static void launcher_done(void) { [g_root startGame]; }
     [self.view addSubview:self.pad];
     self.fps = front_ios_fps_label();   // above the pad, which hides while a controller is connected
     if (self.fps) [self.view addSubview:self.fps];
+    // The game's own picture is not an accessibility surface: with the system's VoiceOver on (a TV shared with someone who needs it)
+    // there is nothing to narrate here — the fps counter and the touch pad would otherwise be spoken at every focus move
+    for (UIView *v in @[ self.view, self.game, self.pad ]) { v.isAccessibilityElement = NO; v.accessibilityElementsHidden = YES; }
+    if (self.fps) { self.fps.isAccessibilityElement = NO; self.fps.accessibilityElementsHidden = YES; }
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
     tv_attach();   // a TV connected while the launcher showed
