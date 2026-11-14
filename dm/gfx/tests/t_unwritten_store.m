@@ -29,7 +29,7 @@ static result run(int enabled, int mode) {
     static uint64_t frame; uint64_t started=bp_now(); mtl_set_frame(++frame);
     g_udc_ab=enabled; g_udc_ab_on=0;
     state_reset(); memset(&R,0,sizeof R); mtl_sub_begin(); seed();
-    S.ds=(ds_st){.dt=1,.dw=mode==1,.df=NVN_DEPTH_FUNC_LESS,.st=mode==2,
+    S.ds=(ds_st){.dt=1,.dw=mode==1||mode==7,.df=NVN_DEPTH_FUNC_LESS,.st=mode==2,
         .sf_f=NVN_STENCIL_FUNC_ALWAYS,.sf_b=NVN_STENCIL_FUNC_ALWAYS,
         .fail_f=NVN_STENCIL_OP_KEEP,.zfail_f=NVN_STENCIL_OP_KEEP,.zpass_f=NVN_STENCIL_OP_REPLACE,
         .fail_b=NVN_STENCIL_OP_KEEP,.zfail_b=NVN_STENCIL_OP_KEEP,.zpass_b=NVN_STENCIL_OP_REPLACE};
@@ -53,13 +53,14 @@ static result run(int enabled, int mode) {
         NvProg *alias=[NvProg new]; alias->sh[1]=[NvShader new];
         alias->sh[1]->rf.color_mask=1; alias->sh[1]->rf.nb=1;
         int kinds[]={NVN_RB_IMG,NVN_RB_SBUFP,NVN_RB_SBUFU};
-        alias->sh[1]->rf.b[0]=(nvn_rbind){.kind=kinds[mode-4],.rw=1}; udc_note_draw(alias);
+        alias->sh[1]->rf.b[0]=(nvn_rbind){.kind=kinds[(mode-4)%3],.rw=1}; udc_note_draw(alias, 1);
     }
     rp_end();
     }
     id<MTLBuffer> b[3]; b[0]=[g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
     b[1]=[g_dev newBufferWithLength:256 options:MTLResourceStorageModeShared];
     b[2]=[g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    if(!b[0]||!b[1]||!b[2]) { fprintf(stderr,"readback buffers: out of memory\n"); abort(); }
     [blit() copyFromTexture:tex_mtl(&color) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(8,8,1) toBuffer:b[0] destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];
     [blit() copyFromTexture:tex_mtl(&depth) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(8,8,1) toBuffer:b[1] destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256 options:MTLBlitOptionDepthFromDepthStencil];
     [blit() copyFromTexture:tex_mtl(&depth) sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(8,8,1) toBuffer:b[2] destinationOffset:0 destinationBytesPerRow:8 destinationBytesPerImage:64 options:MTLBlitOptionStencilFromDepthStencil];
@@ -79,7 +80,7 @@ int main(int argc,char **argv) { @autoreleasepool {
     NvProg *pr=[NvProg new]; pr->sh[0]=[NvShader new]; pr->sh[1]=[NvShader new];
     pr->sh[0]->fn=[lib newFunctionWithName:@"v"]; pr->sh[1]->fn=[lib newFunctionWithName:@"f"];
     pr->sh[1]->stage=1; pr->sh[1]->rf.color_mask=1; serial_put(program.serial,pr);
-    for (int case_id=0;case_id<(bench?12:7);case_id++) {
+    for (int case_id=0;case_id<(bench?12:8);case_id++) {
         int mode=bench?0:case_id;
         result off,on;
         if(case_id&1) { on=run(1,mode); off=run(0,mode); }
@@ -87,7 +88,7 @@ int main(int argc,char **argv) { @autoreleasepool {
         CHECK(!memcmp(off.color,on.color,256)&&!memcmp(off.depth,on.depth,256)&&!memcmp(off.stencil,on.stencil,64),"store-all and elided planes match byte for byte");
         int good=1; for(int i=0;i<64;i++) {
             uint8_t red[4]={255,0,0,255}; good &= !memcmp(on.color+4*i,red,4);
-            good &= on.depth[i]==(mode==1?.5f:mode==3?.625f:.75f);
+            good &= on.depth[i]==(mode==1||mode==7?.5f:mode==3?.625f:.75f);
             good &= on.stencil[i]==(mode==2?0x36:mode==3?0x63:0x2d);
         }
         CHECK(good,"all 64 pixels match hand-computed color/depth/stencil");
