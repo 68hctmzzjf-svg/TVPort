@@ -14,7 +14,7 @@ Update 2.0.2 (v393216) over the base game, SDK 19.3.11 (NVN 55). Game Freak's Tr
 | `pad_layout simple` | `game.tsv` | the 2D gamepad layout |
 | `depth_mode zero` | `game.tsv` | the game sets near = 0 with `nvnDeviceSetDepthMode`; see [Pipeline bases made before the game runs](#pipeline-bases-made-before-the-game-runs) |
 
-`render_cond` stays off: it changes nothing in this game.
+Render conditions, which the host evaluates for every game: evaluating them changed nothing in this game.
 
 ## Memory
 
@@ -70,10 +70,38 @@ Each item was found from a red line or a pass dump on the way through the langua
 - A save made there continues with `DM_KEYS="f300:A*3/150"` (play from about frame 600), and `LUp~12` then walks along the platform.
 - A 5-minute walk: GPU about 6 ms a frame, no crash.
 
+## Build performance
+
+- **Resolved: a chain-only update rebuilt the offline pipeline archive.** The mechanism: [archive reuse across chains](../../../docs/reference/shaders.md#offline-pipeline-archive-rebuilt-after-a-chain-only-update).
+- **Measured, 2026-10-31, one run each:** Apple M2 Max, macOS 26.6, Xcode 27.0, Mac app build with `--allow-other-metal`. A temporary comment in a chain tool changed the chain version and no shader output, so both runs compiled from the same 26,029 bases and library bytes. A chain change that alters a library in the archive still rebuilds it.
+
+| Archive stage after the chain update | Time |
+|---|---:|
+| Old key: `metal-tt` ran again | 462.78 s (7m43s) |
+| Content key: archive reused | 10.10 s |
+| Saved | 452.68 s (7m33s), 97.8% |
+
+- **Current:** this game's profile does not set `pso_mtl4`, so its default iOS build makes no offline archive and gains nothing from this stage. No gameplay run used the reused archive; `regress.py check` compared its 28,603 shaders only, since the game has no `smoke.tsv`.
+
+### Shader extraction reuse
+
+- **Resolved: a translation-only update repeated the shader split.** The mechanism: [shader extraction reuse](../../../docs/reference/shaders.md#shader-extraction-reruns-after-translation-only-updates).
+- **Measured, 2026-11-01, one run each:** same machine and toolchain, with this game's 2.0.2 NSPs and DLC unchanged and the same comment-only kind of chain edit. The old extractor's fresh package was byte-identical to the reused one.
+
+| Split after the chain update | Time |
+|---|---:|
+| Old key: the split ran again | 276.04 s (4m36s) |
+| New key: package reused | 0.64 s |
+| Saved | 275.40 s (4m35s), 99.8% |
+
+- **Current:** this game's packs go through its own Oodle decoder in the Mac host, so an update that also changes another host source still splits again. The host itself is rebuilt for each chain, about 16 s of that stage in a full build.
+
 ## Found on this game
 
 General host changes first needed here; each applies to every game:
 
+- **Shader extraction reuse after translation-only updates:** [Shader extraction reruns after translation-only updates](../../../docs/reference/shaders.md#shader-extraction-reruns-after-translation-only-updates).
+- **Offline pipeline archive reuse across chains:** [Offline pipeline archive rebuilt after a chain-only update](../../../docs/reference/shaders.md#offline-pipeline-archive-rebuilt-after-a-chain-only-update).
 - **The pool enforced as on Horizon** (`mem_map_limit`, `hle_svc.c`): [the profile keys](../README.md#keys), [Maps past the application pool fail as on Horizon](../../../docs/reference/memory.md#maps-past-the-application-pool-fail-as-on-horizon).
 - **Trinity packs decoded with the game's own Oodle** (`trpfs_jobs` / `trinity_shaders`, `hle_oodle.c`, `DM_OODLE_HOST` / `DM_OODLE_MODULES`, set by the NSP script for any game with `ONEPACK` files): [BNSH in Trinity packs](../../../docs/reference/shaders.md#bnsh-in-trinity-packs), [01, Compressed RomFS content](../../../docs/agents/01-extract.md#compressed-romfs-content).
 - **SDK 19 calls:** csrng bytes, `GetAudioOutBufferCount` from the host queue, NVN state getters, `WaitForAddress` type 3, `OP_FENCE_SYNC`: [Cryptographically random bytes](../../../docs/reference/services.md#cryptographically-random-bytes), [AudioOut buffer count from the host queue](../../../docs/reference/audio.md#audioout-buffer-count-from-the-host-queue), [State read back through NVN getters](../../../docs/reference/nvn-objects.md#state-read-back-through-nvn-getters), [WaitForAddress type 3](../../../docs/reference/threads.md#waitforaddress-type-3-64-bit-wait-if-equal), [Fence syncs recorded in command buffers](../../../docs/reference/nvn-objects.md#fence-syncs-recorded-in-command-buffers).
@@ -82,6 +110,7 @@ General host changes first needed here; each applies to every game:
 - **Bounds checks before image-atomic pointer construction and matched image/buffer admission:** [Bounds of image atomics](../../../docs/reference/shaders.md#bounds-of-image-atomics).
 - **The host's StandardAllocator cap** (`hle_svc.c` "StandardAllocator's address space", the `stdalloc_cap` key): [StandardAllocators over 12 to 62 GB of address space](../../../docs/reference/memory.md#standardallocators-over-12-to-62-gb-of-address-space).
 - **The address region table and the NSP script's region check** (`patch_nso.py` "Address regions", `hle_svc.c`, `DM_REGIONS`): its allocator region, 4 GB through `nn::mem::StandardAllocator::Initialize`, returning to `main+0x1b2e690` in `nninitStartup` (the function at `main+0x1b3e3b0` that sets the size tail-calls the SDK), opened to its end by the startup block, which is why the check judges a region by who lays it out: [Measuring address regions and commits](../../../docs/reference/memory.md#measuring-address-regions-and-commits).
+- **Specialized second functions in the offline pipeline archive** (`needs_cut` in `pso_offline.py`): with `depth_mode zero` a pulling vertex shader's base takes its library's second function `main0_z`, which `metal-tt` 32023.922 cannot specialize, so the Mac app's archive step failed and the app had no archive (26,030 bases planned; issue #2337): [Specialized second functions in the offline pipeline archive](../../../docs/reference/shaders.md#specialized-second-functions-in-the-offline-pipeline-archive).
 
 ## Open
 
@@ -89,5 +118,5 @@ General host changes first needed here; each applies to every game:
 - The driver-segment word `0x640`, added to the vertex ID by 58 shaders, stays 0 until what the driver puts there is known.
 - Transform feedback: only plain array draws are captured; indexed, indirect or instanced ones give a red line. Feedback layouts other than one output per buffer from x on get a red line and no capture entry point.
 - `c85de3713170e519` ORs bit fields into output 0 and has not been seen with an integer attachment (no row).
-- The development notes list "the render condition the host does not evaluate" among the Mac route's red lines; `render_cond` changes nothing here and stays off.
+- The development notes list "the render condition the host does not evaluate" among the Mac route's red lines; evaluating it changed nothing here.
 - `game.tsv`'s header says "Plays on the Mac"; AGENTS.md and the development notes say it is playable on the iPhone.

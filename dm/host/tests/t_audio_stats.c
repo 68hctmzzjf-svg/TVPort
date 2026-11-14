@@ -12,10 +12,11 @@ static char lines[8][512];
 static void checked_flockfile(FILE *f) { (void)f; if (in_callback) atomic_fetch_add(&callback_io, 1); }
 static void checked_funlockfile(FILE *f) { (void)f; }
 static int checked_fputc(int c, FILE *f) { (void)f; return c; }
-static int checked_fprintf(FILE *f, const char *fmt, ...) {
-    (void)f;
-    if (in_callback) { atomic_fetch_add(&callback_io, 1); return 0; }
-    if (!strstr(fmt, "device callbacks")) return 0;
+static int checked_fprintf(FILE *f, const char *fmt, ...) { (void)f; (void)fmt; if (in_callback) atomic_fetch_add(&callback_io, 1); return 0; }
+// A log line (dm.h LOG is one call, dm_log): hle_audio.c's lines come here
+__attribute__((format(printf, 1, 2))) static void checked_log(const char *fmt, ...) {
+    if (in_callback) { atomic_fetch_add(&callback_io, 1); return; }
+    if (!strstr(fmt, "device callbacks")) return;
     if (atomic_exchange(&block_report, 0)) {
         dispatch_semaphore_signal(report_entered);
         dispatch_semaphore_wait(report_allow, DISPATCH_TIME_FOREVER);
@@ -25,13 +26,15 @@ static int checked_fprintf(FILE *f, const char *fmt, ...) {
     if (n < 8) vsnprintf(lines[n], sizeof lines[n], fmt, ap);
     va_end(ap);
     atomic_fetch_add(&reports, 1); dispatch_semaphore_signal(report_done);
-    return 0;
 }
 #define flockfile checked_flockfile
 #define funlockfile checked_funlockfile
 #define fputc checked_fputc
 #define fprintf checked_fprintf
+#define DM_LOG_IMPL   // dm.h declares dm_log, which is checked_log here, and leaves its definition out
+#define dm_log checked_log
 #include "../hle_audio.c"
+#undef dm_log
 #undef fprintf
 #undef fputc
 #undef funlockfile
@@ -59,7 +62,16 @@ static int render(void *out, int count, int with_pcm) {
         if (with_pcm && !h_au_Append(out, &b)) return 0;
         AudioBufferList bl = {.mNumberBuffers = 1, .mBuffers = {{2, frames * 4, played}}};
         in_callback = 1; au_render(a, NULL, NULL, 0, frames, &bl); in_callback = 0;
-        if (with_pcm && ((a->event && !wait_for(released_event)) || memcmp(input, played, (size_t)frames * 4) || h_au_Released(out) != &b)) return 0;
+        if (with_pcm) {
+            int woke = !a->event || wait_for(released_event);
+            int same = !memcmp(input, played, (size_t)frames * 4);
+            gbuf *returned = woke && same ? h_au_Released(out) : NULL;
+            if (!woke || !same || returned != &b) {
+                printf("release handoff %d/%d: event=%d PCM=%d buffer=%d pending=%d armed=%d\n",
+                       i + 1, count, woke, same, returned == &b, atomic_load(&a->notify_pending), atomic_load(&a->notify_armed));
+                return 0;
+            }
+        }
     }
     return 1;
 }
@@ -103,6 +115,16 @@ int main(void) {
     CHECK(atomic_load(&reports) == 5, "the watchdog logs its copied report after the output was freed");
     CHECK(!atomic_load(&signals), "statistics wakes never signal a guest buffer-release event");
     CHECK(!atomic_load(&callback_io), "all callback paths remain free of diagnostic stdio");
+
+    // One buffer per event repeatedly crosses the notifier's disarm/recheck
+    // boundary. Bulk PCM stress can coalesce releases and miss a stranded wake.
+    atomic_store(&signals, 0);
+    CHECK(!h_au_OpenDef(out, ev, prm), "open output for release-handoff stress");
+    atomic_store(&ao(out)->state, STATE_STARTED);
+    CHECK(render(out, 100000, 1), "every individual release handoff makes progress");
+    CHECK(atomic_load(&signals) == 100000, "all 100000 event-driven buffers are released");
+    CHECK(!atomic_load(&callback_io), "release-handoff stress keeps diagnostics off the callback");
+    h_au_Close(out);
     dispatch_release(report_entered); dispatch_release(report_allow); dispatch_release(report_done); dispatch_release(released_event);
     printf("audio callback statistics: %d checks, %d failures\n", checks, failures);
     return failures != 0;
